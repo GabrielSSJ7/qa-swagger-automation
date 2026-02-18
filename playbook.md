@@ -197,12 +197,22 @@ python tools/qa_swagger.py run \
 O script executa cada test case via httpx, valida o status code e campos esperados,
 e salva os resultados com os payloads de resposta.
 
-### 4.2 Capturar screenshots REAIS do browser (happy path)
+### 4.2 Capturar screenshots REAIS do browser (TODOS os test cases)
 
 **IMPORTANTE:** Screenshots sao do browser Chrome real controlado via MCP DevTools.
 Nao sao imagens geradas ou fabricadas.
 
-#### Passo 1: Abrir Swagger UI
+**REGRA:** Cada screenshot DEVE mostrar AMBOS:
+1. O **curl command** gerado pelo Swagger UI
+2. A **resposta do servidor** (status code + response body)
+
+Para garantir isso, SEMPRE scroll para o heading "Curl" antes de capturar o screenshot.
+A area abaixo do Curl mostra a Request URL e o Server Response, capturando tudo em uma unica imagem.
+
+#### Passo 1: Abrir Swagger UI e instalar fetch interceptor
+
+O Swagger UI NAO envia o token via `Authorization` header mesmo apos autenticar pelo modal.
+A solucao e instalar um **fetch interceptor** que injeta o token em todas as requests para a API.
 
 ```
 Tool: mcp__chrome-devtools__navigate_page
@@ -214,56 +224,56 @@ Tool: mcp__chrome-devtools__wait_for
   timeout: 15000
 ```
 
-#### Passo 2: Autenticar no Swagger
-
-```
-Tool: mcp__chrome-devtools__take_snapshot
-  → Encontrar uid do botao "Authorize"
-
-Tool: mcp__chrome-devtools__click
-  uid: "<uid do Authorize>"
-  includeSnapshot: true
-  → No snapshot retornado, encontrar uid do input de token
-
-Tool: mcp__chrome-devtools__fill
-  uid: "<uid do input>"
-  value: "Bearer eyJ..."
-
-Tool: mcp__chrome-devtools__click
-  uid: "<uid do Authorize dentro do modal>"
-
-Tool: mcp__chrome-devtools__click
-  uid: "<uid do Close>"
-```
-
-#### Passo 3: Para CADA test case happy path
-
-**3a. Expandir endpoint:**
+**Instalar fetch interceptor com auth:**
 ```
 Tool: mcp__chrome-devtools__evaluate_script
   function: |
     () => {
-      const blocks = document.querySelectorAll('.opblock-summary');
-      for (const b of blocks) {
-        if (b.textContent.includes('{PATH}') && b.textContent.includes('{METHOD}')) {
-          b.scrollIntoView({ behavior: 'smooth', block: 'center' });
-          b.click();
-          return 'expanded';
+      const TOKEN = '<jwt_token_aqui>';
+      window._originalFetch = window.fetch.bind(window);
+      window.fetch = function(url, opts) {
+        opts = opts || {};
+        if (typeof url === 'string' && url.includes('localhost:8000/api/')) {
+          opts.headers = opts.headers || {};
+          if (opts.headers instanceof Headers) {
+            opts.headers.set('Authorization', 'Bearer ' + TOKEN);
+          } else {
+            opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+          }
+          if (window._interceptNextRequest && window._replaceInUrl) {
+            url = url.replace(window._replaceInUrl.from, window._replaceInUrl.to);
+            window._interceptNextRequest = false;
+          }
         }
-      }
-      return 'not found';
+        return window._originalFetch(url, opts);
+      };
+      return 'interceptor installed';
     }
 ```
 
-**3b. Try it out + preencher parametros:**
+**NOTA:** O interceptor suporta dois modos:
+- **Auth injection:** Sempre adiciona `Authorization: Bearer <token>` em requests para a API
+- **URL replacement:** Quando `window._interceptNextRequest = true` e `window._replaceInUrl = {from, to}`,
+  substitui texto na URL antes de enviar. Util para bypassar validacao client-side do Swagger UI.
+
+#### Passo 2: Expandir endpoint e ativar Try it out
+
 ```
+Tool: mcp__chrome-devtools__take_snapshot
+  → Encontrar uid do endpoint desejado e expandir
+
 Tool: mcp__chrome-devtools__take_snapshot
   → Encontrar uid do "Try it out"
 
 Tool: mcp__chrome-devtools__click
   uid: "<Try it out>"
   includeSnapshot: true
+```
 
+#### Passo 3: Para CADA test case (happy path + edge cases)
+
+**3a. Preencher parametros:**
+```
 Tool: mcp__chrome-devtools__fill_form
   elements: [
     { "uid": "<param1>", "value": "{valor1}" },
@@ -271,29 +281,71 @@ Tool: mcp__chrome-devtools__fill_form
   ]
 ```
 
-**3c. Executar e capturar:**
+**3b. (Se necessario) Configurar interceptor para test case especifico:**
+
+Para test cases que precisam bypassar validacao client-side do Swagger UI
+(ex: UUID invalido, page=0, page_size > max), usar o URL replacement interceptor:
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    () => {
+      window._interceptNextRequest = true;
+      window._replaceInUrl = { from: 'page_size=20', to: 'page_size=101' };
+      return 'interceptor armed';
+    }
+```
+
+O Swagger UI envia o valor valido do form, mas o interceptor substitui na URL real
+antes da request sair. Isso permite testar valores que o Swagger UI bloquearia client-side.
+
+Para test cases sem auth (401), desativar a injecao de token temporariamente:
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    () => {
+      window.fetch = function(url, opts) {
+        return window._originalFetch(url, opts);
+      };
+      return 'auth disabled';
+    }
+```
+
+**3c. Executar e aguardar resposta:**
 ```
 Tool: mcp__chrome-devtools__click
   uid: "<Execute>"
 
 Tool: mcp__chrome-devtools__wait_for
-  text: "Response body"
+  text: "Server response"
   timeout: 30000
-
-Tool: mcp__chrome-devtools__take_screenshot
-  filePath: "/tmp/qa-evidence/tc-001-swagger.png"
 ```
 
-**3d. Limpar para proximo:**
+**3d. Scroll para Curl e capturar screenshot:**
+
+**OBRIGATORIO:** Antes de capturar, scroll para o heading "Curl" para que
+o screenshot mostre curl command + response body juntos.
+
 ```
 Tool: mcp__chrome-devtools__evaluate_script
   function: |
     () => {
-      const btn = document.querySelector('.btn-clear');
-      if (btn) { btn.click(); return 'cleared'; }
-      return 'no button';
+      const headings = document.querySelectorAll('h4');
+      for (const h of headings) {
+        if (h.textContent.trim() === 'Curl') {
+          h.scrollIntoView({ block: 'start' });
+          return 'scrolled to Curl';
+        }
+      }
+      return 'Curl heading not found';
     }
+
+Tool: mcp__chrome-devtools__take_screenshot
+  filePath: "/tmp/qa-evidence/tc-{NNN}-swagger.png"
 ```
+
+**3e. (Se desativou auth) Reinstalar interceptor com auth para o proximo test case.**
 
 **REGRA DE UIDs:** Sempre usar UIDs do snapshot MAIS RECENTE.
 UIDs mudam apos qualquer acao que modifica o DOM.
@@ -303,12 +355,16 @@ Nunca reutilizar UIDs de snapshots anteriores.
 
 ## Fase 5: Upload de Imagens e Report no PR
 
-### 5.1 Upload de screenshots
+### 5.1 Upload de screenshots (TODOS os test cases)
+
+Upload CADA screenshot capturado (happy path + edge cases).
 
 **Metodo primario: catbox.moe (zero deps, permanente, sem API key)**
 
 ```bash
 python tools/qa_swagger.py upload /tmp/qa-evidence/tc-001-swagger.png
+python tools/qa_swagger.py upload /tmp/qa-evidence/tc-002-swagger.png
+# ... para todos os TCs
 ```
 
 Retorna JSON:
@@ -327,6 +383,8 @@ Retorna JSON:
 
 ### 5.2 Gerar report
 
+**IMPORTANTE:** O map `--images` deve conter URLs para TODOS os test cases (happy + edge).
+
 ```bash
 python tools/qa_swagger.py report \
   --results /tmp/qa-results.json \
@@ -334,7 +392,7 @@ python tools/qa_swagger.py report \
   --us US-044 \
   --branch feat/US44 \
   --auth-strategy "Keycloak password grant" \
-  --images '{"TC-001": "https://files.catbox.moe/abc123.png"}' \
+  --images '{"TC-001": "https://files.catbox.moe/abc.png", "TC-002": "https://files.catbox.moe/def.png", ...}' \
   --output /tmp/qa-report.md
 ```
 
@@ -369,16 +427,19 @@ python tools/qa_swagger.py run \
   --base-url http://localhost:8000 \
   --output /tmp/qa-results.json
 
-# 6. [Claude Code usa MCP DevTools para screenshots do browser - ver Fase 4.2]
+# 6. [Claude Code usa MCP DevTools para screenshots de TODOS os TCs - ver Fase 4.2]
+#    Cada screenshot deve mostrar curl command + response body
 
-# 7. Upload screenshots
+# 7. Upload screenshots (todos os TCs)
 python tools/qa_swagger.py upload /tmp/qa-evidence/tc-001-swagger.png
+python tools/qa_swagger.py upload /tmp/qa-evidence/tc-002-swagger.png
+# ... para todos os TCs
 
-# 8. Gerar report
+# 8. Gerar report (images com TODOS os TCs)
 python tools/qa_swagger.py report \
   --results /tmp/qa-results.json \
   --pr 45 --us US-044 --branch feat/US44 \
-  --images '{"TC-001": "https://files.catbox.moe/abc123.png"}' \
+  --images '{"TC-001": "https://...", "TC-002": "https://...", ...}' \
   --output /tmp/qa-report.md
 
 # 9. Postar no PR
@@ -414,7 +475,8 @@ python tools/qa_swagger.py post --pr 45 --body-file /tmp/qa-report.md
   ↓
 
 [MCP DevTools] Browser disponivel?
-  SIM → Screenshots reais do Swagger UI (happy path)
+  SIM → Screenshots reais do Swagger UI (TODOS os TCs: happy + edge)
+        Cada screenshot deve mostrar curl command + response body
   NAO → Pular screenshots, usar apenas payloads JSON
   ↓
 

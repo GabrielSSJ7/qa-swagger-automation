@@ -509,6 +509,10 @@ def cmd_report(args):
                 lines.append("```json")
                 lines.append(truncated)
                 lines.append("```")
+            img_url = images.get(r["id"]) or r.get("screenshot_url", "")
+            if img_url:
+                lines.append("")
+                lines.append(f"![{r['id']}]({img_url})")
             if r.get("notes"):
                 lines.append(f"\n> {r['notes']}")
             lines.append("")
@@ -516,7 +520,6 @@ def cmd_report(args):
             lines.append("")
 
     lines.append("---")
-    lines.append("> Validacao automatizada via Claude Code + MCP DevTools + qa_swagger.py")
 
     markdown = "\n".join(lines)
     out_path = Path(args.output)
