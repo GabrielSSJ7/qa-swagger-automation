@@ -6,6 +6,23 @@ Agnostico ao projeto - funciona com qualquer API REST que exponha OpenAPI/Swagge
 
 ---
 
+## Setup
+
+```bash
+git clone git@github.com:GabrielSSJ7/qa-swagger-automation.git ~/code/qa-swagger-automation
+cd ~/code/qa-swagger-automation
+chmod +x setup.sh
+./setup.sh
+```
+
+O script `setup.sh`:
+1. Instala dependencias (`httpx`)
+2. Adiciona automaticamente a referencia no `~/.claude/CLAUDE.md` com os caminhos absolutos do repo clonado
+
+Apos rodar, Claude Code tera acesso global a ferramenta em qualquer projeto.
+
+---
+
 ## Arquitetura
 
 ```
