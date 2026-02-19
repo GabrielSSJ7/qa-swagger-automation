@@ -528,6 +528,19 @@ def cmd_report(args):
     return 0
 
 
+def _find_existing_qa_comment(pr: int) -> int | None:
+    proc = subprocess.run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/issues/{pr}/comments",
+         "--jq", '.[] | select(.body | startswith("## QA:")) | .id'],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    lines = proc.stdout.strip().splitlines()
+    last = lines[-1].strip()
+    return int(last) if last.isdigit() else None
+
+
 def cmd_post(args):
     if args.body_file:
         body = Path(args.body_file).read_text()
@@ -535,6 +548,21 @@ def cmd_post(args):
         body = args.body
     else:
         print(json.dumps({"error": "--body ou --body-file obrigatorio"}))
+        return 1
+
+    existing_id = _find_existing_qa_comment(args.pr)
+
+    if existing_id:
+        proc = subprocess.run(
+            ["gh", "api", "--method", "PATCH",
+             f"repos/{{owner}}/{{repo}}/issues/comments/{existing_id}",
+             "-f", f"body={body}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 0:
+            print(json.dumps({"status": "updated", "pr": args.pr, "comment_id": existing_id}))
+            return 0
+        print(json.dumps({"error": proc.stderr, "pr": args.pr, "action": "update"}))
         return 1
 
     proc = subprocess.run(
