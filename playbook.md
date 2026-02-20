@@ -353,54 +353,375 @@ Nunca reutilizar UIDs de snapshots anteriores.
 
 ---
 
-## Fase 5: Upload de Imagens e Report no PR
+## Fase 5: Validacao GitHub + Report no PR (via Browser)
 
-### 5.1 Upload de screenshots (TODOS os test cases)
+**OBRIGATORIO:** Esta fase usa MCP DevTools para validar login no GitHub, fazer upload de imagens diretamente no PR e postar o comentario. Upload externo (catbox, imgbb) e fallback somente se MCP DevTools nao estiver disponivel.
 
-Upload CADA screenshot capturado (happy path + edge cases).
+### 5.0 Validar Login no GitHub (MANDATORIO)
 
-**Metodo primario: catbox.moe (zero deps, permanente, sem API key)**
+Antes de QUALQUER operacao no GitHub, o agente DEVE validar que o browser esta logado na conta correta. Esta validacao deve ocorrer imediatamente antes do upload, NAO no inicio do fluxo.
 
-```bash
-python tools/qa_swagger.py upload /tmp/qa-evidence/tc-001-swagger.png
-python tools/qa_swagger.py upload /tmp/qa-evidence/tc-002-swagger.png
-# ... para todos os TCs
+#### Passo 1: Navegar para o GitHub e verificar login
+
+```
+Tool: mcp__chrome-devtools__navigate_page
+  type: "url"
+  url: "https://github.com"
+  timeout: 15000
 ```
 
-Retorna JSON:
-```json
-{"url": "https://files.catbox.moe/abc123.png", "markdown": "![tc-001](https://...)"}
+#### Passo 2: Verificar se esta logado
+
+Aguardar que o DOM esteja pronto e extrair login via meta tag com retry:
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    async () => {
+      for (let i = 0; i < 10; i++) {
+        const meta = document.querySelector('meta[name="user-login"]');
+        if (meta && meta.getAttribute('content')) {
+          return { logged_in: true, username: meta.getAttribute('content') };
+        }
+        if (document.querySelector('a[href="/login"]')) {
+          return { logged_in: false };
+        }
+        await new Promise(r => setTimeout(r, 500));
+      }
+      const meta = document.querySelector('meta[name="user-login"]');
+      return meta && meta.getAttribute('content')
+        ? { logged_in: true, username: meta.getAttribute('content') }
+        : { logged_in: false };
+    }
 ```
 
-**Alternativas disponiveis:**
+**Analise do resultado:**
+- `logged_in: false` → **NAO esta logado**, ir para Passo 3a
+- `logged_in: true` → **Esta logado**, ir para Passo 3b
 
-| Host | Comando | Requer API key? | Permanente? |
-|------|---------|-----------------|-------------|
-| catbox.moe | `qa_swagger.py upload FILE` | Nao | Sim |
-| imgbb | `qa_swagger.py upload FILE --host imgbb --api-key KEY` | Sim (gratis) | Sim |
-| github (assets branch) | `qa_swagger.py upload FILE --host github --repo OWNER/REPO --pr 45` | Nao (usa gh auth) | Sim |
-| images-upload-cli | `imgup -h catbox -f markdown FILE` | Depende do host | Depende |
+#### Passo 3a: Se NAO estiver logado
 
-### 5.2 Gerar report
+Usar `AskUserQuestion` para pedir ao usuario que faca login:
 
-**IMPORTANTE:** O map `--images` deve conter URLs para TODOS os test cases (happy + edge).
+> "O browser do MCP DevTools NAO esta logado no GitHub.
+> Por favor, faca login na sua conta do GitHub no browser do Chrome DevTools
+> e me avise quando estiver pronto."
+
+Apos o usuario confirmar, **repetir Passo 2** para validar.
+NAO prosseguir ate confirmar login.
+
+#### Passo 3b: Validar conta correta
+
+Comparar o `username` retornado com o owner/org do repositorio (obtido na Fase 0 via `REPO`).
+
+**Verificar permissao no repositorio:**
+
+```
+Tool: mcp__chrome-devtools__navigate_page
+  type: "url"
+  url: "https://github.com/{REPO}/pull/{PR_NUMBER}"
+
+Tool: mcp__chrome-devtools__wait_for
+  text: "Leave a comment"
+  timeout: 15000
+```
+
+Se a pagina nao carregar o PR, mostrar 404, ou nao aparecer "Leave a comment":
+
+> "O browser esta logado como '{username_atual}', mas nao tem acesso ao repositorio '{REPO}'.
+> Por favor, troque para a conta correta no browser e me avise quando estiver pronto."
+
+Apos o usuario confirmar, **repetir desde Passo 2**.
+
+### 5.1 Upload de Imagens via GitHub (MANDATORIO - TODOS os TCs)
+
+**OBRIGATORIO:** Cada screenshot DEVE ser upado diretamente no GitHub via o file input da area de comentarios do PR. Isso garante hosting permanente no CDN do GitHub (`user-images.githubusercontent.com`) sem depender de servicos externos.
+
+**IMPORTANTE:** Fazer upload de UMA imagem por vez. Aguardar o GitHub processar e retornar a URL antes de enviar a proxima.
+
+#### Para CADA screenshot:
+
+**Passo 1: Navegar para o PR (se nao estiver nele)**
+
+```
+Tool: mcp__chrome-devtools__navigate_page
+  type: "url"
+  url: "https://github.com/{REPO}/pull/{PR_NUMBER}"
+
+Tool: mcp__chrome-devtools__wait_for
+  text: "Leave a comment"
+  timeout: 15000
+```
+
+**Passo 2: Localizar a area de comentario e o file input**
+
+O file input do GitHub e tipicamente um `<input type="file">` oculto dentro da area de comentario.
+Pode estar associado ao botao "Attach files" ou a area de drag-and-drop.
+
+```
+Tool: mcp__chrome-devtools__take_snapshot
+  → Encontrar o textarea de comentario e o input type="file" para upload
+  → Se o file input nao estiver visivel no snapshot, usar evaluate_script:
+```
+
+Se o file input nao aparecer no snapshot da a11y tree:
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    () => {
+      const input = document.querySelector('input[type="file"][data-upload-policy-url]')
+                 || document.querySelector('.js-upload-markdown-image input[type="file"]')
+                 || document.querySelector('#new_comment_field ~ input[type="file"]');
+      if (input) {
+        input.style.display = 'block';
+        input.style.opacity = '1';
+        input.style.position = 'relative';
+        return 'file input revealed';
+      }
+      return 'file input not found';
+    }
+```
+
+Apos revelar o file input, fazer novo `take_snapshot` para obter o uid.
+
+**Passo 3: Upload do screenshot**
+
+```
+Tool: mcp__chrome-devtools__upload_file
+  uid: "<file-input-uid>"
+  filePath: "/tmp/qa-evidence/tc-{NNN}-swagger.png"
+```
+
+**Passo 4: Aguardar processamento do GitHub**
+
+O GitHub processa o upload e insere markdown `![image](url)` no textarea.
+DEVE aguardar ate que a URL apareca — NAO submeter antes disso.
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    async () => {
+      const textarea = document.querySelector('#new_comment_field')
+                    || document.querySelector('textarea[name="comment[body]"]');
+      if (!textarea) return { error: 'textarea not found' };
+      for (let i = 0; i < 30; i++) {
+        const val = textarea.value;
+        if (val.includes('user-images.githubusercontent.com') && !val.includes('Uploading')) {
+          const match = val.match(/!\[.*?\]\((https:\/\/user-images\.githubusercontent\.com\/[^\)]+)\)/);
+          return match ? { url: match[1] } : { error: 'url pattern not matched', value: val };
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      return { error: 'timeout waiting for upload', value: textarea.value };
+    }
+```
+
+**CRITICO:** Se o textarea contiver texto `Uploading` ou placeholder sem URL, o upload ainda esta em andamento. NAO prosseguir.
+
+**Se retornar `error: 'timeout waiting for upload'`:**
+1. Tentar novamente (limpar textarea e re-upload do mesmo arquivo)
+2. Se falhar 2x consecutivas, usar fallback (Fase 5.5) para este screenshot especifico
+3. Continuar com os demais screenshots normalmente
+
+**Passo 5: Extrair URL e limpar textarea**
+
+Armazenar a URL retornada no mapeamento `{TC_ID: github_cdn_url}`.
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    () => {
+      const textarea = document.querySelector('#new_comment_field')
+                    || document.querySelector('textarea[name="comment[body]"]');
+      if (!textarea) return 'not found';
+      const nativeSet = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value'
+      ).set;
+      nativeSet.call(textarea, '');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'cleared';
+    }
+```
+
+**Repetir Passos 2-5 para CADA screenshot.** Resultado: mapeamento completo `{TC_ID: github_cdn_url}`.
+
+### 5.2 Gerar Report com URLs do GitHub
 
 ```bash
 python tools/qa_swagger.py report \
   --results /tmp/qa-results.json \
-  --pr 45 \
-  --us US-044 \
-  --branch feat/US44 \
-  --auth-strategy "Keycloak password grant" \
-  --images '{"TC-001": "https://files.catbox.moe/abc.png", "TC-002": "https://files.catbox.moe/def.png", ...}' \
+  --pr {PR_NUMBER} \
+  --us {US_CODE} \
+  --branch {BRANCH} \
+  --auth-strategy "{AUTH_STRATEGY}" \
+  --images '{"TC-001": "https://user-images.githubusercontent.com/...", ...}' \
   --output /tmp/qa-report.md
 ```
 
-### 5.3 Postar no PR
+### 5.3 Postar Comentario via Browser (MANDATORIO)
+
+#### Verificar comentario QA existente
+
+Usar `gh API` para detectar comentario existente (mais confiavel que busca no DOM):
 
 ```bash
-python tools/qa_swagger.py post --pr 45 --body-file /tmp/qa-report.md
+gh api "repos/{REPO}/issues/{PR_NUMBER}/comments" \
+  --jq '.[] | select(.body | startswith("## QA:")) | .id' | tail -1
 ```
+
+#### Se existe comentario QA anterior → EDITAR
+
+1. Navegar para o PR (se nao estiver nele):
+
+```
+Tool: mcp__chrome-devtools__navigate_page
+  type: "url"
+  url: "https://github.com/{REPO}/pull/{PR_NUMBER}"
+
+Tool: mcp__chrome-devtools__wait_for
+  text: "Leave a comment"
+  timeout: 15000
+```
+
+2. Encontrar o botao de editar (icone de lapis / "Edit") no comentario QA:
+
+```
+Tool: mcp__chrome-devtools__take_snapshot
+  → Encontrar botao de editar do comentario QA existente
+
+Tool: mcp__chrome-devtools__click
+  uid: "<edit-button-uid>"
+  includeSnapshot: true
+```
+
+3. Limpar o textarea de edicao:
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    (textarea) => {
+      const nativeSet = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype, 'value'
+      ).set;
+      nativeSet.call(textarea, '');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      return 'cleared';
+    }
+  args: [{ "uid": "<edit-textarea-uid>" }]
+```
+
+4. Obter UIDs atualizados apos o clear (DOM pode ter re-renderizado):
+
+```
+Tool: mcp__chrome-devtools__take_snapshot
+  → Encontrar o textarea de edicao atualizado e o botao "Update comment"
+```
+
+5. Preencher com o novo report:
+
+```
+Tool: mcp__chrome-devtools__fill
+  uid: "<edit-textarea-uid-atualizado>"
+  value: "<conteudo de /tmp/qa-report.md>"
+```
+
+6. Clicar em "Update comment" e verificar sucesso:
+
+```
+Tool: mcp__chrome-devtools__click
+  uid: "<update-comment-button-uid>"
+```
+
+Aguardar que o formulario de edicao desapareca (indica que o update foi salvo):
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    async () => {
+      for (let i = 0; i < 15; i++) {
+        const editForm = document.querySelector('.is-comment-editing');
+        if (!editForm) return { success: true };
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      return { success: false, error: 'edit form still visible after 15s' };
+    }
+```
+
+#### Se NAO existe comentario QA → CRIAR NOVO
+
+1. Scroll ate a area de comentario no final do PR:
+
+```
+Tool: mcp__chrome-devtools__take_snapshot
+  → Encontrar textarea de novo comentario
+```
+
+2. Preencher com o report:
+
+```
+Tool: mcp__chrome-devtools__fill
+  uid: "<comment-textarea-uid>"
+  value: "<conteudo de /tmp/qa-report.md>"
+```
+
+3. Clicar em "Comment" e aguardar postagem:
+
+```
+Tool: mcp__chrome-devtools__click
+  uid: "<comment-button-uid>"
+```
+
+Aguardar que o novo comentario apareca na timeline (o textarea ficara vazio apos sucesso):
+
+```
+Tool: mcp__chrome-devtools__evaluate_script
+  function: |
+    async () => {
+      for (let i = 0; i < 15; i++) {
+        const textarea = document.querySelector('#new_comment_field')
+                      || document.querySelector('textarea[name="comment[body]"]');
+        if (textarea && textarea.value.trim() === '') {
+          const comments = document.querySelectorAll('.timeline-comment .comment-body');
+          const last = comments[comments.length - 1];
+          if (last && last.textContent.includes('QA:')) return { success: true };
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+      return { success: false, error: 'comment not detected after 15s' };
+    }
+```
+
+### 5.4 Verificar Sucesso
+
+```
+Tool: mcp__chrome-devtools__take_screenshot
+  filePath: "/tmp/qa-evidence/pr-comment-posted.png"
+```
+
+Confirmar visualmente que:
+- O comentario aparece no PR
+- As imagens estao visiveis (nao quebradas)
+- O conteudo do report esta completo
+
+### 5.5 Fallback (SOMENTE se MCP DevTools indisponivel)
+
+Se MCP DevTools NAO estiver disponivel (verificado na Fase 1), usar o fluxo alternativo:
+
+```bash
+python tools/qa_swagger.py upload /tmp/qa-evidence/tc-001-swagger.png
+python tools/qa_swagger.py upload /tmp/qa-evidence/tc-002-swagger.png
+
+python tools/qa_swagger.py report \
+  --results /tmp/qa-results.json \
+  --pr {PR_NUMBER} --us {US_CODE} --branch {BRANCH} \
+  --images '{"TC-001": "https://files.catbox.moe/...", ...}' \
+  --output /tmp/qa-report.md
+
+python tools/qa_swagger.py post --pr {PR_NUMBER} --body-file /tmp/qa-report.md
+```
+
+> **NOTA:** Este fallback usa upload externo (catbox.moe) e gh CLI. So usar quando MCP DevTools nao esta disponivel.
 
 ---
 
@@ -430,20 +751,24 @@ python tools/qa_swagger.py run \
 # 6. [Claude Code usa MCP DevTools para screenshots de TODOS os TCs - ver Fase 4.2]
 #    Cada screenshot deve mostrar curl command + response body
 
-# 7. Upload screenshots (todos os TCs)
-python tools/qa_swagger.py upload /tmp/qa-evidence/tc-001-swagger.png
-python tools/qa_swagger.py upload /tmp/qa-evidence/tc-002-swagger.png
-# ... para todos os TCs
+# 7. [Validar login no GitHub via MCP DevTools - ver Fase 5.0]
+#    Navegar para github.com, verificar meta[name="user-login"]
+#    Se nao logado ou conta errada → pedir ao usuario para logar
 
-# 8. Gerar report (images com TODOS os TCs)
+# 8. [Upload screenshots via GitHub PR comment - ver Fase 5.1]
+#    Para cada TC: upload_file no file input do PR → aguardar URL do GitHub CDN
+#    Resultado: mapeamento {TC_ID: github_cdn_url}
+
+# 9. Gerar report (com URLs do GitHub CDN)
 python tools/qa_swagger.py report \
   --results /tmp/qa-results.json \
   --pr 45 --us US-044 --branch feat/US44 \
-  --images '{"TC-001": "https://...", "TC-002": "https://...", ...}' \
+  --images '{"TC-001": "https://user-images.githubusercontent.com/...", ...}' \
   --output /tmp/qa-report.md
 
-# 9. Postar no PR
-python tools/qa_swagger.py post --pr 45 --body-file /tmp/qa-report.md
+# 10. [Postar comentario via browser MCP DevTools - ver Fase 5.3]
+#     Preencher textarea do PR com report → clicar "Comment"
+#     Se comentario QA ja existe → editar em vez de criar novo
 ```
 
 ---
@@ -480,12 +805,23 @@ python tools/qa_swagger.py post --pr 45 --body-file /tmp/qa-report.md
   NAO → Pular screenshots, usar apenas payloads JSON
   ↓
 
-[upload] Upload screenshots
-  qa_swagger.py upload (catbox.moe | imgbb | github)
+[github-login] GitHub logado no browser?
+  NAO → Pedir ao usuario para logar → Re-validar
+  CONTA ERRADA → Pedir ao usuario trocar conta → Re-validar
+  SIM ↓
+
+[upload-github] Upload screenshots via PR comment
+  MCP DevTools upload_file → aguardar GitHub CDN URLs
+  MCP INDISPONIVEL → Fallback: qa_swagger.py upload (catbox.moe)
   ↓
 
-[report] Gerar e postar no PR
-  qa_swagger.py report → qa_swagger.py post
+[report] Gerar report com URLs do GitHub CDN
+  qa_swagger.py report --images '{...}'
+  ↓
+
+[post-browser] Postar comentario via browser
+  MCP DevTools fill + click Comment
+  MCP INDISPONIVEL → Fallback: qa_swagger.py post
 ```
 
 ---
